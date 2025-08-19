@@ -1,0 +1,146 @@
+//@version=6
+strategy(
+     title = "Multi-Filter 10% TP / 2% SL (v6)",
+     shorttitle = "MF 10/2 v6",
+     overlay = true,
+     initial_capital = 100000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,            // 0.05% per side (adjust to your broker)
+     slippage = 1,                        // 1 tick of slippage
+     pyramiding = 0,
+     calc_on_order_fills = true,
+     calc_on_every_tick = true,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1
+)
+
+// ====== Inputs ======
+grpRisk  = "Risk / Target"
+account  = input.float(100000, "Account Size (for sizing)", group = grpRisk, minval = 1000, step = 1000)
+riskPct  = input.float(2.0, "Risk % of Account per Trade", group = grpRisk, minval = 0.1, step = 0.1) / 100.0
+tpPct    = input.float(10.0, "Take-Profit %", group = grpRisk, minval = 0.1, step = 0.1) / 100.0
+slPct    = input.float(2.0, "Stop-Loss %", group = grpRisk, minval = 0.1, step = 0.1) / 100.0
+qtyStep  = input.float(1, "Quantity Step (lots/shares rounding)", group = grpRisk, minval = 1, step = 1)
+
+grpFilters = "Signal Filters"
+emaFastLen = input.int(50,  "EMA Fast", group = grpFilters, minval = 2)
+emaSlowLen = input.int(200, "EMA Slow", group = grpFilters, minval = 5)
+stATRlen   = input.int(10,  "Supertrend ATR Length", group = grpFilters, minval = 2)
+stFactor   = input.float(3.0,"Supertrend Factor", group = grpFilters, minval = 1.0, step = 0.1)
+useMACD    = input.bool(true, "Require MACD Cross", group = grpFilters)
+useRSI     = input.bool(false,"Use RSI Filter", group = grpFilters)
+rsiLen     = input.int(14, "RSI Length", group = grpFilters, minval = 2)
+rsiMinLong = input.int(50, "RSI ≥ for Long", group = grpFilters, minval = 1, maxval = 99)
+rsiMaxShort= input.int(50, "RSI ≤ for Short", group = grpFilters, minval = 1, maxval = 99)
+
+grpVol     = "Volatility Gate"
+useATRgate = input.bool(true, "Enable ATR Volatility Gate", group = grpVol)
+atrLen     = input.int(14, "ATR Length", group = grpVol, minval = 2)
+minATRpct  = input.float(0.3, "Min ATR as % of Price", group = grpVol, minval = 0.05, step = 0.05) / 100.0
+
+grpMTF     = "Higher Timeframe Trend"
+useHTF     = input.bool(true, "Use HTF 200 EMA Trend Filter", group = grpMTF)
+htfTF      = input.timeframe("60", "HTF (e.g., 60, 240, D)", group = grpMTF)
+
+grpTrade   = "Trading Controls"
+allowShort = input.bool(true, "Allow Shorts", group = grpTrade)
+sessionStr = input.session("24x7", "Session", group = grpTrade)
+cooldown   = input.int(0, "Cooldown Bars after Exit", group = grpTrade, minval = 0)
+
+// ====== Helpers ======
+inSession  = session.ismarket(sessionStr)
+emaFast    = ta.ema(close, emaFastLen)
+emaSlow    = ta.ema(close, emaSlowLen)
+
+// Supertrend (returns line & dir where dir: 1=up, -1=down)
+[stLine, stDir] = ta.supertrend(stFactor, stATRlen)
+stUp  = stDir == 1
+stDn  = stDir == -1
+
+// MACD
+[macd, macdSig, _] = ta.macd(close, 12, 26, 9)
+macdUp   = ta.crossover(macd, macdSig)
+macdDown = ta.crossunder(macd, macdSig)
+
+// RSI
+rsi = ta.rsi(close, rsiLen)
+
+// ATR gate
+atr      = ta.atr(atrLen)
+atrPct   = nz(atr / close, 0.0)
+volOK    = useATRgate ? atrPct >= minATRpct : true
+
+// HTF filter: close > EMA200 on higher timeframe (for longs), inverse for shorts
+htfBull = request.security(syminfo.tickerid, htfTF, close > ta.ema(close, 200))
+htfBear = request.security(syminfo.tickerid, htfTF, close < ta.ema(close, 200))
+htfOKLong  = useHTF ? htfBull : true
+htfOKShort = useHTF ? htfBear : true
+
+// ====== Entry Conditions ======
+trendLong  = close > emaFast and emaFast > emaSlow and stUp
+trendShort = close < emaFast and emaFast < emaSlow and stDn
+
+rsiOKLong  = useRSI ? (rsi >= rsiMinLong) : true
+rsiOKShort = useRSI ? (rsi <= rsiMaxShort) : true
+
+signalLong  = inSession and trendLong  and volOK and htfOKLong  and (useMACD ? macdUp   : true) and rsiOKLong
+signalShort = inSession and trendShort and volOK and htfOKShort and (useMACD ? macdDown : true) and rsiOKShort and allowShort
+
+// Basic cooldown control: wait N bars after a flat -> new position
+barsSinceFlat = ta.barssince(strategy.position_size == 0)
+canEnter      = nz(barsSinceFlat, 9999) >= cooldown
+
+// ====== Position Sizing by Risk ======
+// Approximate qty = (Account * Risk%) / (EntryPrice * stop%)
+calcQty(price) =>
+    raw = (account * riskPct) / (price * slPct)
+    // Round down to lot/share step if needed
+    step = math.max(qtyStep, 1.0)
+    math.floor(raw / step) * step
+
+// ====== Order Placement ======
+var string longID  = "Long"
+var string shortID = "Short"
+
+// Enter Long
+if canEnter and strategy.position_size <= 0 and signalLong
+    q = calcQty(close)
+    if q > 0
+        strategy.entry(id = longID, direction = strategy.long, qty = q)
+
+// Enter Short
+if canEnter and strategy.position_size >= 0 and signalShort
+    q = calcQty(close)
+    if q > 0
+        strategy.entry(id = shortID, direction = strategy.short, qty = q)
+
+// ====== Risk Management (TP / SL updated every bar) ======
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    longStop  = avg * (1.0 - slPct)
+    longLimit = avg * (1.0 + tpPct)
+    strategy.exit("L-TP/SL", from_entry = longID, stop = longStop, limit = longLimit)
+
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    shortStop  = avg * (1.0 + slPct)
+    shortLimit = avg * (1.0 - tpPct)
+    strategy.exit("S-TP/SL", from_entry = shortID, stop = shortStop, limit = shortLimit)
+
+// ====== Visuals ======
+plot(emaFast, "EMA Fast", color.new(color.teal, 0))
+plot(emaSlow, "EMA Slow", color.new(color.orange, 0))
+plot(stLine, "Supertrend", color = stUp ? color.new(color.lime, 0) : color.new(color.red, 0))
+plotshape(signalLong  and canEnter, title="Long Signal",  style=shape.triangleup,  location=location.belowbar, size=size.tiny, color=color.lime)
+plotshape(signalShort and canEnter, title="Short Signal", style=shape.triangledown,location=location.abovebar, size=size.tiny, color=color.red)
+
+// Info label
+var label info = na
+if barstate.islast
+    txt = "ATR%: " + str.tostring(atrPct*100, "#.##") + "%\n" +
+          "TP: " + str.tostring(tpPct*100, "#.##") + "% | SL: " + str.tostring(slPct*100, "#.##") + "%\n" +
+          "Risk/Trade: " + str.tostring(riskPct*100, "#.##") + "% of " + str.tostring(account, "#,###")
+    if na(info)
+        info := label.new(bar_index, high, txt, style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 0))
+    else
+        label.set_x(info, bar_index), label.set_y(info, high), label.set_text(info, txt)
