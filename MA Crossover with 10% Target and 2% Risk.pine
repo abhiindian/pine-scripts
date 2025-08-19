@@ -1,0 +1,31 @@
+//@version=6
+strategy("MA Crossover with 10% Target and 2% Risk", overlay=true, process_orders_on_close=true, default_qty_type=strategy.fixed)
+
+equityPercent = input.float(2, title="Equity % to Risk per Trade") / 100
+percentTarget = input.float(10, title="Target %") / 100
+
+// Simple entry condition: MA crossover
+smaShort = ta.sma(close, 10)
+smaLong = ta.sma(close, 30)
+longCondition = ta.crossover(smaShort, smaLong)
+
+// Calculate stop distance (using ATR for dynamic stop)
+atrLen = input.int(14, title="ATR Length")
+atrMult = input.float(1.5, title="ATR Multiplier")
+atr = ta.atr(atrLen)
+stopDistance = atr * atrMult
+
+if (longCondition)
+    // Calculate risk capital and quantity
+    riskCapital = strategy.equity * equityPercent
+    qty = math.round(riskCapital / stopDistance)
+    
+    // Calculate stop and target prices
+    stopPrice = close - stopDistance
+    targetPrice = close * (1 + percentTarget)
+    
+    strategy.entry("Long", strategy.long, qty=qty)
+    strategy.exit("Exit Long", from_entry="Long", stop=stopPrice, limit=targetPrice)
+
+plot(smaShort, color=color.blue)
+plot(smaLong, color=color.orange)
